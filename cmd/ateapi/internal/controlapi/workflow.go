@@ -24,6 +24,7 @@ import (
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/workercache"
 	"github.com/agent-substrate/substrate/internal/resources"
 	listersv1alpha1 "github.com/agent-substrate/substrate/pkg/client/listers/api/v1alpha1"
+	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -67,7 +68,7 @@ func markSkipped(ctx context.Context, reason string) {
 
 // ActorWorkflow handles the workflows for actor's resume / suspend operations.
 type ActorWorkflow struct {
-	store                store.Interface
+	store                actorWorkflowStore
 	workerCache          *workercache.Cache
 	scheduler            scheduling.Scheduler
 	dialer               *AteletDialer
@@ -82,7 +83,7 @@ type ActorWorkflow struct {
 
 // NewActorWorkflow creates a new ActorWorkflow. instruments may be nil.
 func NewActorWorkflow(
-	store store.Interface,
+	store actorWorkflowStore,
 	workerCache *workercache.Cache,
 	dialer *AteletDialer,
 	actorTemplateLister listersv1alpha1.ActorTemplateLister,
@@ -108,16 +109,53 @@ func NewActorWorkflow(
 	}
 }
 
-func (w *ActorWorkflow) acquireActorLock(ctx context.Context, actorRef resources.ActorRef) (context.Context, *store.Lock, error) {
-	lockKey := "lock:actor:" + actorRef.Atespace + ":" + actorRef.Name
+// actorWorkflowStore enumerates the exact storage methods needed by
+// ActorWorkflow and nothing more.
+type actorWorkflowStore interface {
+	GetActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error)
+	UpdateActor(ctx context.Context, actorRef resources.ActorRef, precondition store.Precondition, mutate func(toUpdate *ateapipb.Actor) error) (*ateapipb.Actor, error)
+	DeleteActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error)
+	GetWorker(ctx context.Context, name string) (*ateapipb.Worker, error)
+	UpdateWorker(ctx context.Context, name string, precondition store.Precondition, mutate func(toUpdate *ateapipb.Worker) error) (*ateapipb.Worker, error)
+	GetActorSnapshot(ctx context.Context, snapshotRef resources.ActorSnapshotRef) (*ateapipb.ActorSnapshot, error)
+	CreateActorSnapshot(ctx context.Context, snapshot *ateapipb.ActorSnapshot) (*ateapipb.ActorSnapshot, error)
+	GetActorTemplate(ctx context.Context, templateRef resources.ActorTemplateRef) (*ateapipb.ActorTemplate, error)
+	AcquireLease(ctx context.Context, key string) (*store.Lease, error)
+}
 
-	lock, err := w.store.AcquireLock(ctx, lockKey)
+// WorkerWorkflow handles the multi-step operations on a Worker.
+//
+// Its steps reach across the Actor↔Worker binding, which an ActorWorkflow step
+// does from the other side: releasing the Actor bound to a Worker stays
+// in-process because there is no bind/release RPC.
+type WorkerWorkflow struct {
+	store workerWorkflowStore
+}
+
+// NewWorkerWorkflow creates a new WorkerWorkflow.
+func NewWorkerWorkflow(store workerWorkflowStore) *WorkerWorkflow {
+	return &WorkerWorkflow{store: store}
+}
+
+// workerWorkflowStore enumerates the exact storage methods needed by
+// WorkerWorkflow and nothing more.
+type workerWorkflowStore interface {
+	GetWorker(ctx context.Context, name string) (*ateapipb.Worker, error)
+	DeleteWorker(ctx context.Context, name string, pre store.DeletePreconditions) (*ateapipb.Worker, error)
+	GetActor(ctx context.Context, actorRef resources.ActorRef) (*ateapipb.Actor, error)
+	UpdateActor(ctx context.Context, actorRef resources.ActorRef, precondition store.Precondition, mutate func(toUpdate *ateapipb.Actor) error) (*ateapipb.Actor, error)
+}
+
+func (w *ActorWorkflow) acquireActorLease(ctx context.Context, actorRef resources.ActorRef) (context.Context, *store.Lease, error) {
+	leaseKey := "lease:actor:" + actorRef.Atespace + ":" + actorRef.Name
+
+	lease, err := w.store.AcquireLease(ctx, leaseKey)
 	if err != nil {
-		if errors.Is(err, store.ErrLockConflict) {
+		if errors.Is(err, store.ErrLeaseConflict) {
 			return nil, nil, status.Error(grpcCodes.Aborted, "another operation is in progress for this actor")
 		}
-		return nil, nil, fmt.Errorf("while acquiring lock: %w", err)
+		return nil, nil, fmt.Errorf("while acquiring lease: %w", err)
 	}
 
-	return lock.Context(), lock, nil
+	return lease.Context(), lease, nil
 }

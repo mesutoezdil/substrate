@@ -38,14 +38,79 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	httpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	discoverygrpc "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	secretgrpc "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
 
 	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/ingress"
+	"github.com/agent-substrate/substrate/internal/atunnel"
 )
+
+// assertDualStackIngress checks an ingress listener keeps its 0.0.0.0 primary
+// and gains exactly one "::" socket on the same port.
+func assertDualStackIngress(t *testing.T, l *listenerv3.Listener, wantPort uint32) {
+	t.Helper()
+
+	sa := l.GetAddress().GetSocketAddress()
+	if sa.GetAddress() != "0.0.0.0" {
+		t.Errorf("Expected address '0.0.0.0', got %s", sa.GetAddress())
+	}
+	if sa.GetPortValue() != wantPort {
+		t.Errorf("Expected port %d, got %d", wantPort, sa.GetPortValue())
+	}
+
+	addrs := l.GetAdditionalAddresses()
+	if len(addrs) != 1 {
+		t.Fatalf("Expected 1 additional address on %s, got %d", l.GetName(), len(addrs))
+	}
+
+	asa := addrs[0].GetAddress().GetSocketAddress()
+	if asa.GetAddress() != "::" {
+		t.Errorf("Expected additional address '::', got %s", asa.GetAddress())
+	}
+	if asa.GetIpv4Compat() {
+		t.Error("Expected additional address Ipv4Compat to be false")
+	}
+	if asa.GetPortValue() != wantPort {
+		t.Errorf("Expected additional port %d, got %d", wantPort, asa.GetPortValue())
+	}
+}
+
+func assertHCMWebsocketUpgrade(t *testing.T, l *listenerv3.Listener) {
+	t.Helper()
+	if len(l.GetFilterChains()) == 0 || len(l.GetFilterChains()[0].GetFilters()) == 0 {
+		t.Fatalf("Expected at least one filter chain and filter")
+	}
+	filter := l.GetFilterChains()[0].GetFilters()[0]
+	if filter.GetName() != "envoy.filters.network.http_connection_manager" {
+		t.Errorf("Expected HCM filter, got '%s'", filter.GetName())
+	}
+
+	hcmAny := filter.GetTypedConfig()
+	hcm := &hcmv3.HttpConnectionManager{}
+	if err := hcmAny.UnmarshalTo(hcm); err != nil {
+		t.Fatalf("Failed to unmarshal HCM config: %v", err)
+	}
+
+	if len(hcm.GetUpgradeConfigs()) == 0 {
+		t.Errorf("Expected UpgradeConfigs to be populated")
+	} else {
+		upgradeFound := false
+		for _, cfg := range hcm.GetUpgradeConfigs() {
+			if cfg.GetUpgradeType() == "websocket" {
+				upgradeFound = true
+				break
+			}
+		}
+		if !upgradeFound {
+			t.Errorf("Expected 'websocket' in UpgradeConfigs")
+		}
+	}
+}
 
 func TestXdsServer_UpdateSnapshot(t *testing.T) {
 	server := NewXdsServer(18000)
@@ -150,13 +215,9 @@ func TestXdsServer_UpdateSnapshot(t *testing.T) {
 		t.Errorf("Listener name '%s' is missing from snapshot listeners", IngressHTTPListener)
 	} else {
 		l := raw.(*listenerv3.Listener)
-		sa := l.GetAddress().GetSocketAddress()
-		if sa.GetPortValue() != 8081 {
-			t.Errorf("Expected port 8081, got %d", sa.GetPortValue())
-		}
-		if sa.GetAddress() != "0.0.0.0" {
-			t.Errorf("Expected address '0.0.0.0', got %s", sa.GetAddress())
-		}
+		assertDualStackIngress(t, l, 8081)
+
+		assertHCMWebsocketUpgrade(t, l)
 	}
 }
 
@@ -191,10 +252,7 @@ func TestXdsServer_UpdateSnapshot_WithHttps(t *testing.T) {
 		t.Errorf("Listener name '%s' is missing from snapshot listeners", IngressHTTPSListener)
 	} else {
 		l := raw.(*listenerv3.Listener)
-		sa := l.GetAddress().GetSocketAddress()
-		if sa.GetPortValue() != 8443 {
-			t.Errorf("Expected port 8443, got %d", sa.GetPortValue())
-		}
+		assertDualStackIngress(t, l, 8443)
 
 		// Verify the TLS config references the serving cert via SDS rather
 		// than embedding it: inline filename DataSources are read only once
@@ -277,6 +335,106 @@ func TestXdsServer_UpdateSnapshot_HttpsWithoutCertPath(t *testing.T) {
 	}
 	if got := snap.GetResources(resourcev3.SecretType); len(got) != 0 {
 		t.Errorf("Expected no secrets without a cert path, got %d", len(got))
+	}
+}
+
+// TestXdsServer_UpdateSnapshot_ConnectDisabledByDefault locks in that the
+// CONNECT-terminating listeners/cluster are opt-in: with SetConnectPorts never
+// called (both ports default to 0), UpdateSnapshot must produce exactly the
+// same resources as if CONNECT support didn't exist, matching the HTTPS
+// listener's existing httpsPort>0 gating convention.
+func TestXdsServer_UpdateSnapshot_ConnectDisabledByDefault(t *testing.T) {
+	server := NewXdsServer(18000)
+	server.SetConfig(8085, 50053, "127.0.0.1")
+
+	if err := server.UpdateSnapshot(); err != nil {
+		t.Fatalf("UpdateSnapshot failed: %v", err)
+	}
+	res, err := server.snapshot.GetSnapshot(NodeID)
+	if err != nil {
+		t.Fatalf("Failed to get snapshot: %v", err)
+	}
+	snap := res.(*cachev3.Snapshot)
+
+	clustersMap := snap.GetResources(resourcev3.ClusterType)
+	if _, exists := clustersMap[MainInternalName]; exists {
+		t.Errorf("%s cluster must not be built when CONNECT is disabled", MainInternalName)
+	}
+	if len(clustersMap) != 2 {
+		t.Errorf("Expected 2 cluster definitions with CONNECT disabled, got %d", len(clustersMap))
+	}
+
+	listenersMap := snap.GetResources(resourcev3.ListenerType)
+	for _, name := range []string{"connect_terminate", "connect_terminate_tls", MainInternalName} {
+		if _, exists := listenersMap[name]; exists {
+			t.Errorf("listener %q must not be built when CONNECT is disabled", name)
+		}
+	}
+	if len(listenersMap) != 1 {
+		t.Errorf("Expected only the HTTP listener with CONNECT disabled, got %d listeners", len(listenersMap))
+	}
+}
+
+// TestXdsServer_UpdateSnapshot_WithConnect enables both the plaintext and TLS
+// CONNECT listeners and checks the resources they need are wired up,
+// including that the TLS CONNECT listener triggers the shared cert secret
+// even when the ordinary HTTPS listener (httpsPort) is left disabled.
+func TestXdsServer_UpdateSnapshot_WithConnect(t *testing.T) {
+	const certPath = "/run/servicedns.podcert.ate.dev/credential-bundle.pem"
+
+	server := NewXdsServer(18000)
+	server.SetConfig(8085, 50053, "127.0.0.1")
+	server.SetConnectPorts(8081, 8444)
+	// httpsPort left at 0: only the CONNECT-TLS listener wants the cert here.
+	server.SetTlsConfig(0, certPath)
+
+	if err := server.UpdateSnapshot(); err != nil {
+		t.Fatalf("UpdateSnapshot failed: %v", err)
+	}
+	res, err := server.snapshot.GetSnapshot(NodeID)
+	if err != nil {
+		t.Fatalf("Failed to get snapshot: %v", err)
+	}
+	snap := res.(*cachev3.Snapshot)
+	if err := snap.Consistent(); err != nil {
+		t.Fatalf("Integrity check failed on snapshot: %v", err)
+	}
+
+	clustersMap := snap.GetResources(resourcev3.ClusterType)
+	if _, exists := clustersMap[MainInternalName]; !exists {
+		t.Errorf("%s cluster missing with CONNECT enabled", MainInternalName)
+	}
+
+	listenersMap := snap.GetResources(resourcev3.ListenerType)
+	if _, exists := listenersMap[IngressHTTPSListener]; exists {
+		t.Error("plain HTTPS listener must not be built when only httpsPort is left disabled")
+	}
+	if raw, exists := listenersMap["connect_terminate"]; !exists {
+		t.Error("connect_terminate listener missing")
+	} else {
+		l := raw.(*listenerv3.Listener)
+		assertDualStackIngress(t, l, 8081)
+		assertHCMWebsocketUpgrade(t, l)
+	}
+	if raw, exists := listenersMap["connect_terminate_tls"]; !exists {
+		t.Error("connect_terminate_tls listener missing")
+	} else {
+		l := raw.(*listenerv3.Listener)
+		assertDualStackIngress(t, l, 8444)
+		assertHCMWebsocketUpgrade(t, l)
+		ts := l.GetFilterChains()[0].GetTransportSocket()
+		if ts.GetName() != "envoy.transport_sockets.tls" {
+			t.Errorf("Expected connect_terminate_tls to be TLS-wrapped, got transport socket %q", ts.GetName())
+		}
+	}
+	if _, exists := listenersMap[MainInternalName]; !exists {
+		t.Errorf("%s listener missing with CONNECT enabled", MainInternalName)
+	}
+
+	// The TLS CONNECT listener alone must be enough to require the secret.
+	secretsMap := snap.GetResources(resourcev3.SecretType)
+	if _, exists := secretsMap[HTTPSCertSecretName]; !exists {
+		t.Error("cert secret missing even though connect_terminate_tls needs it")
 	}
 }
 
@@ -650,6 +808,121 @@ func TestXdsServer_RouteTimeout(t *testing.T) {
 	})
 }
 
+// TestXdsServer_BuildOriginalDstCluster_UsesMetadataKey covers the fix for a
+// header-mutation-only LB config: a header only works for HTTP traffic, so
+// the ORIGINAL_DST cluster must resolve its destination from
+// ingress.OriginalDstMetadataKey/ingress.OriginalDstAddressKey dynamic
+// metadata instead (see buildOriginalDstCluster and
+// ingress.Handler.HandleRequestHeaders).
+func TestXdsServer_BuildOriginalDstCluster_UsesMetadataKey(t *testing.T) {
+	x := NewXdsServer(18000)
+	lbConfig := x.buildOriginalDstCluster().GetLbConfig().(*clusterv3.Cluster_OriginalDstLbConfig_).OriginalDstLbConfig
+	if lbConfig.GetUseHttpHeader() {
+		t.Error("UseHttpHeader must not be set: it only applies to HTTP traffic, and dynamic metadata is the mechanism ext_proc uses instead")
+	}
+	key := lbConfig.GetMetadataKey()
+	if key.GetKey() != ingress.OriginalDstMetadataKey {
+		t.Errorf("Expected MetadataKey.Key %q, got %q", ingress.OriginalDstMetadataKey, key.GetKey())
+	}
+	path := key.GetPath()
+	if len(path) != 1 || path[0].GetKey() != ingress.OriginalDstAddressKey {
+		t.Errorf("Expected MetadataKey.Path [%q], got %v", ingress.OriginalDstAddressKey, path)
+	}
+}
+
+// TestXdsServer_ActorClusterProtocolOptions pins where downstream-protocol
+// mirroring is allowed: only on the mTLS atunnel leg, where atunnel guards
+// HTTP/1.1-only actors by downgrading non-gRPC HTTP/2 (see
+// atunnel.protocolMirrorTransport). The legacy plaintext cluster dials the
+// actor directly with no such guard, so it must carry no protocol options at
+// all — Envoy's implicit HTTP/1.1.
+func TestXdsServer_ActorClusterProtocolOptions(t *testing.T) {
+	x := NewXdsServer(18000)
+
+	if opts := x.buildOriginalDstCluster().GetTypedExtensionProtocolOptions(); len(opts) != 0 {
+		t.Errorf("legacy plaintext actor cluster has protocol options %v, want none (implicit HTTP/1.1)", opts)
+	}
+
+	x.SetUpstreamTls("/run/bundle.pem", "/run/trust.pem", "spiffe://ate.dev/")
+	cluster := x.buildOriginalDstCluster()
+	ts := cluster.GetTransportSocket()
+	if ts == nil {
+		t.Fatal("mTLS actor cluster is missing its transport socket")
+	}
+	// The upstream TLS context must NOT set alpn_protocols: with
+	// use_downstream_protocol_config, Envoy already offers the single ALPN
+	// matching each connection pool's protocol. A static ["h2","http/1.1"]
+	// list would override that, and Go's atunnel server (which negotiates by
+	// server preference) would pick h2 on connections belonging to the
+	// HTTP/1.1 pool, breaking it.
+	upstreamTls := &tlsv3.UpstreamTlsContext{}
+	if err := ts.GetTypedConfig().UnmarshalTo(upstreamTls); err != nil {
+		t.Fatalf("Failed to unmarshal UpstreamTlsContext: %v", err)
+	}
+	if alpn := upstreamTls.GetCommonTlsContext().GetAlpnProtocols(); len(alpn) != 0 {
+		t.Errorf("upstream TLS context ALPN = %v, want none (per-pool ALPN comes from use_downstream_protocol_config)", alpn)
+	}
+	raw, ok := cluster.GetTypedExtensionProtocolOptions()[httpProtocolOptionsName]
+	if !ok {
+		t.Fatalf("mTLS actor cluster is missing %q protocol options", httpProtocolOptionsName)
+	}
+	protoOpts := &httpv3.HttpProtocolOptions{}
+	if err := raw.UnmarshalTo(protoOpts); err != nil {
+		t.Fatalf("Failed to unmarshal HttpProtocolOptions: %v", err)
+	}
+	downstream := protoOpts.GetUseDownstreamProtocolConfig()
+	if downstream == nil {
+		t.Fatalf("mTLS actor cluster protocol options = %v, want use_downstream_protocol_config", protoOpts)
+	}
+	if downstream.GetHttp2ProtocolOptions() == nil {
+		t.Error("use_downstream_protocol_config must enable HTTP/2 so gRPC keeps trailers on the atunnel leg")
+	}
+}
+
+// TestXdsServer_BuildRoutes_DerivesTargetPortHeader covers the fix for atunnel
+// needing the target port as a real header (it can't read Envoy's dynamic
+// metadata directly): rather than ext_proc building that header mutation
+// itself, the route derives it declaratively from the same
+// ingress.OriginalDstMetadataKey/ingress.OriginalDstPortKey metadata ext_proc
+// already writes for the cluster's own MetadataKey, via a
+// %DYNAMIC_METADATA(...)% command operator.
+func TestXdsServer_BuildRoutes_DerivesTargetPortHeader(t *testing.T) {
+	x := NewXdsServer(18000)
+	route := x.buildRoutes().GetVirtualHosts()[0].GetRoutes()[0]
+
+	headers := route.GetRequestHeadersToAdd()
+	if len(headers) != 1 {
+		t.Fatalf("Expected exactly 1 request header to add, got %d: %v", len(headers), headers)
+	}
+	h := headers[0]
+	if got, want := h.GetHeader().GetKey(), atunnel.TargetPortHeader; got != want {
+		t.Errorf("Expected header key %q, got %q", want, got)
+	}
+	wantValue := "%DYNAMIC_METADATA(" + ingress.OriginalDstMetadataKey + ":" + ingress.OriginalDstPortKey + ")%"
+	if got := h.GetHeader().GetValue(); got != wantValue {
+		t.Errorf("Expected header value %q, got %q", wantValue, got)
+	}
+	if got, want := h.GetAppendAction(), corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD; got != want {
+		t.Errorf("Expected append action %s, got %s", want, got)
+	}
+}
+
+// TestBuildConnectRoutes_DisablesTimeout covers a real bug: unlike a
+// WebSocket upgrade, Envoy never disables a route's timeout once a CONNECT
+// tunnel is established, so an unset Timeout here would fall back to Envoy's
+// global default of 15s and silently kill every CONNECT tunnel through this
+// router after 15 seconds regardless of activity.
+func TestBuildConnectRoutes_DisablesTimeout(t *testing.T) {
+	route := buildConnectRoutes().GetVirtualHosts()[0].GetRoutes()[0]
+	timeout := route.GetRoute().GetTimeout()
+	if timeout == nil {
+		t.Fatal("Expected an explicit Timeout, got nil (falls back to Envoy's 15s default)")
+	}
+	if timeout.AsDuration() != 0 {
+		t.Errorf("Expected Timeout 0 (disabled), got %s", timeout.AsDuration())
+	}
+}
+
 func TestXdsServer_SetOtlpCollector(t *testing.T) {
 	// --otlp-collector-address defaults to OTEL_EXPORTER_OTLP_ENDPOINT, so the
 	// URL forms that variable carries have to reduce to the bare host and port
@@ -797,5 +1070,101 @@ func TestXdsServer_BuildTracingRandomSamplingFromPolicy(t *testing.T) {
 				t.Errorf("RandomSampling = %v, want %v", got, tt.wantPercent)
 			}
 		})
+	}
+}
+
+func TestSnapshotVersionsUniqueAcrossRestarts(t *testing.T) {
+	deployAndGetVersion := func(t *testing.T, x *XdsServer) string {
+		t.Helper()
+		if err := x.UpdateSnapshot(); err != nil {
+			t.Fatalf("UpdateSnapshot: %v", err)
+		}
+		snap, err := x.snapshot.GetSnapshot(NodeID)
+		if err != nil {
+			t.Fatalf("GetSnapshot: %v", err)
+		}
+		return snap.GetVersion(resourcev3.ClusterType)
+	}
+
+	seen := map[string]bool{}
+	first := NewXdsServer(0)
+	for range 3 {
+		v := deployAndGetVersion(t, first)
+		if seen[v] {
+			t.Fatalf("version %q minted twice by the same server", v)
+		}
+		seen[v] = true
+	}
+
+	restarted := NewXdsServer(0)
+	for range 3 {
+		v := deployAndGetVersion(t, restarted)
+		if seen[v] {
+			t.Fatalf("version %q reused after restart; Envoy holding that version would not receive the new config", v)
+		}
+		seen[v] = true
+	}
+}
+
+// downstreamTLS extracts the DownstreamTlsContext from a listener's first
+// filter chain.
+func downstreamTLS(t *testing.T, raw any) *tlsv3.DownstreamTlsContext {
+	t.Helper()
+	l := raw.(*listenerv3.Listener)
+	dtc := &tlsv3.DownstreamTlsContext{}
+	if err := l.GetFilterChains()[0].GetTransportSocket().GetTypedConfig().UnmarshalTo(dtc); err != nil {
+		t.Fatalf("Failed to unmarshal DownstreamTlsContext: %v", err)
+	}
+	return dtc
+}
+
+// TestXdsServer_ALPN pins the per-listener ALPN contract. The HTTPS ingress
+// listener always offers h2 before http/1.1: gRPC over TLS requires a
+// negotiated "h2", and the offer is unconditional because atunnel downgrades
+// every non-gRPC request to HTTP/1.1 on the actor leg (see
+// atunnel.protocolMirrorTransport and TestProtocolMirrorTransport), so an
+// HTTP/1.1-only actor cannot tell what the client negotiated at the edge. The
+// CONNECT-TLS listener stays ALPN-free: its clients speak HTTP/1.1 CONNECT,
+// and an h2 offer there would move them onto extended CONNECT the tunnel path
+// does not serve.
+func TestXdsServer_ALPN(t *testing.T) {
+	const certPath = "/run/servicedns.podcert.ate.dev/credential-bundle.pem"
+
+	server := NewXdsServer(18000)
+	server.SetConfig(8085, 50053, "127.0.0.1")
+	server.SetTlsConfig(8443, certPath)
+	server.SetConnectPorts(0, 8444)
+	if err := server.UpdateSnapshot(); err != nil {
+		t.Fatalf("UpdateSnapshot failed: %v", err)
+	}
+	res, err := server.snapshot.GetSnapshot(NodeID)
+	if err != nil {
+		t.Fatalf("Failed to get snapshot: %v", err)
+	}
+	listeners := map[string]any{}
+	for name, l := range res.(*cachev3.Snapshot).GetResources(resourcev3.ListenerType) {
+		listeners[name] = l
+	}
+
+	// h2 first: ALPN is server-preference, and a client that can speak HTTP/2
+	// must land on it rather than on http/1.1.
+	alpn := downstreamTLS(t, listeners[IngressHTTPSListener]).GetCommonTlsContext().GetAlpnProtocols()
+	if len(alpn) != 2 || alpn[0] != "h2" || alpn[1] != "http/1.1" {
+		t.Errorf("HTTPS listener ALPN = %v, want [h2 http/1.1]", alpn)
+	}
+	if alpn := downstreamTLS(t, listeners["connect_terminate_tls"]).GetCommonTlsContext().GetAlpnProtocols(); len(alpn) != 0 {
+		t.Errorf("CONNECT-TLS listener ALPN = %v, want none", alpn)
+	}
+
+	// The offer is only half the contract: the HCM must honor whatever ALPN
+	// negotiated. An explicit HTTP1 codec here would turn every h2 client
+	// into a connection error while the ALPN list still looked right.
+	https := listeners[IngressHTTPSListener].(*listenerv3.Listener)
+	hcm := &hcmv3.HttpConnectionManager{}
+	if err := https.GetFilterChains()[0].GetFilters()[0].GetTypedConfig().UnmarshalTo(hcm); err != nil {
+		t.Fatalf("Failed to unmarshal the HTTPS listener's HCM config: %v", err)
+	}
+	if hcm.GetCodecType() != hcmv3.HttpConnectionManager_AUTO {
+		t.Errorf("HTTPS listener HCM codec = %v, want AUTO so the negotiated protocol is honored", hcm.GetCodecType())
 	}
 }
